@@ -10,7 +10,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { WorkBuddyCredentialStore } from './auth.ts'
-import type { WorkBuddyUpstreamClient } from './upstream.ts'
+import type { WorkBuddyReasoningSelection, WorkBuddyUpstreamClient } from './upstream.ts'
 import { normalizeCredits } from './upstream.ts'
 import type { WorkBuddyModelInfo } from './catalog.ts'
 import { hostIsLoopback, originIsLoopback } from './loopback.ts'
@@ -45,6 +45,10 @@ export interface WorkBuddyStatusRouteOptions {
    * stays out of the document, and the card renders no control for it.
    */
   useMaximumContextWindow?: () => boolean | undefined
+  /** The fixed native effort for one model, when the card set one. */
+  selectedReasoningEffort?: (modelId: string) => WorkBuddyReasoningSelection | undefined
+  /** Whether this host can persist per-model context/effort settings. */
+  modelSettingsWritable?: () => boolean
   /**
    * Per-account hidden-model state for the card's visibility controls.
    * Undefined when the caller offers none (tests, headless profiles); a
@@ -137,6 +141,7 @@ export async function workBuddyWebStatus(
       const supported = model.supportedContextWindows ?? []
       const maxContextWindow = supported.length > 0 ? Math.max(...supported) : undefined
       const defaultContextWindow = model.defaultContextWindow ?? model.contextWindow
+      const selectedReasoningEffort = deps.selectedReasoningEffort?.(model.id)
       return {
         id: model.id,
         name: model.name,
@@ -153,9 +158,11 @@ export async function workBuddyWebStatus(
         ...(model.reasoning?.supportedEfforts?.length ?? 0) > 0
           ? { declaredEfforts: model.reasoning!.supportedEfforts! }
           : {},
+        ...model.reasoning?.supports === true ? { supportsReasoning: true as const } : {},
         ...model.reasoning?.defaultEffort !== undefined
           ? { defaultEffort: model.reasoning.defaultEffort }
           : {},
+        ...selectedReasoningEffort === undefined ? {} : { selectedReasoningEffort },
         // Verbatim from the upstream catalog; omitted when it said nothing.
         ...typeof model.contextWindow === 'number' && model.contextWindow > 0
           ? { contextWindow: model.contextWindow }
@@ -166,6 +173,7 @@ export async function workBuddyWebStatus(
         ...maxContextWindow === undefined || maxContextWindow <= defaultContextWindow
           ? {}
           : { maxContextWindow },
+        ...supported.length === 0 ? {} : { supportedContextWindows: supported },
         ...typeof model.maxInputTokens === 'number' && model.maxInputTokens > 0
           ? { maxInputTokens: model.maxInputTokens }
           : {},
@@ -184,6 +192,7 @@ export async function workBuddyWebStatus(
   const statusWithModels: WorkBuddyWebStatus = modelsField.length > 0
     ? { ...withVisibility, models: modelsField }
     : withVisibility
+  const settingsWritable = deps.modelSettingsWritable?.() === true
   // Probe state rides the signed-in document so the card can render the
   // consent switches and results without a second request. The control key
   // travels with it: this response already passed the loopback guard, and the
@@ -199,6 +208,7 @@ export async function workBuddyWebStatus(
       probe: deps.probe(),
       ...deps.probeKey === undefined ? {} : { probeKey: deps.probeKey },
       ...maximumContextWindow === undefined ? {} : { useMaximumContextWindow: maximumContextWindow },
+      ...settingsWritable ? { modelSettingsWritable: true as const } : {},
     }
   }
   try {

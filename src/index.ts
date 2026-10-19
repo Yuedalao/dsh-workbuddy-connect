@@ -27,7 +27,11 @@ import { createWorkBuddyAdapter } from './adapter.ts'
 import { createWorkBuddyShim } from './shim.ts'
 import { WorkBuddyProbeService } from './probe-service.ts'
 import { newestFirst, WorkBuddyProbeStore, workbuddyProbePath } from './probe-store.ts'
-import { WorkBuddyUpstreamClient } from './upstream.ts'
+import {
+  readCachedAppContextMetadata,
+  WorkBuddyUpstreamClient,
+  type WorkBuddyReasoningSelection,
+} from './upstream.ts'
 import { piAiVersionWarning } from './pi-ai-guard.ts'
 import { registerWorkBuddyStatusRoute } from './web-status.ts'
 import { registerWorkBuddyUpdateRoute } from './update-route.ts'
@@ -115,6 +119,7 @@ export {
   type WorkBuddyCredential,
 } from './auth.ts'
 export {
+  applyReasoningEffortOverride,
   classifyUpstreamError,
   modelWithCurrentPromotion,
   normalizeCredits,
@@ -122,17 +127,20 @@ export {
   prepareChatBody,
   prepareCnChatBody,
   prepareInternationalChatBody,
+  readCachedAppContextMetadata,
   regionOf,
   WorkBuddyUpstreamClient,
   type UpstreamErrorKind,
   type WorkBuddyCatalogFetch,
   type WorkBuddyChatResult,
+  type WorkBuddyContextMetadata,
   type WorkBuddyCredits,
   type WorkBuddyEffort,
   type WorkBuddyModelBilling,
   type WorkBuddyModelReasoning,
   type WorkBuddyPromotion,
   type WorkBuddyRefreshOutcome,
+  type WorkBuddyReasoningSelection,
   type WorkBuddyUpstreamModel,
 } from './upstream.ts'
 export {
@@ -237,6 +245,10 @@ export interface Config {
   probeConsent?: boolean
   /** Use the largest context window the international catalog explicitly offers. */
   useMaximumContextWindow?: boolean
+  /** Per-provider/model DSH context budget, keyed `provider:model`. */
+  contextBudgets?: Record<string, number>
+  /** Per-provider/model fixed native effort, keyed `provider:model`. */
+  reasoningEfforts?: Record<string, WorkBuddyReasoningSelection>
 }
 
 /** Explicit CN desktop auth-file path (shared by the plugin schema and its section). */
@@ -254,6 +266,12 @@ const PROBE_CONSENT_FIELD = z.boolean().default(false)
 // {@link plainConfigBoolean} below.
 const MAXIMUM_CONTEXT_WINDOW_FIELD = z.boolean().default(true).volatile()
   .description('Use the largest context window declared by WorkBuddy AI when alternatives are available (on by default)')
+const MODEL_CONTEXT_BUDGETS_FIELD = z.dict(z.number().step(1).min(1)).default({}).volatile()
+  .description('Per-model DSH context budgets, keyed provider:model')
+const MODEL_REASONING_EFFORTS_FIELD = z.dict(z.union([
+  'default', 'low', 'medium', 'high', 'xhigh', 'max',
+])).default({}).volatile()
+  .description('Per-model native reasoning efforts, keyed provider:model')
 
 // Same `.volatile()` typing artifact as {@link AI_SECTION}: the static
 // default type of the marked field is `Volatile<boolean>`, while consumers
@@ -264,6 +282,8 @@ export const Config = z.object({
   authFileAI: AUTH_FILE_AI_FIELD,
   probeConsent: PROBE_CONSENT_FIELD,
   useMaximumContextWindow: MAXIMUM_CONTEXT_WINDOW_FIELD,
+  contextBudgets: MODEL_CONTEXT_BUDGETS_FIELD,
+  reasoningEfforts: MODEL_REASONING_EFFORTS_FIELD,
 }) as unknown as z<Config>
 
 /**
@@ -280,6 +300,40 @@ function plainConfigBoolean(value: unknown): boolean | undefined {
   return value === undefined ? undefined : value === true
 }
 
+/** Resolve a volatile dictionary field without trusting the wrapper shape. */
+function plainConfigRecord<T>(value: unknown): Record<string, T> {
+  if (value !== null && typeof value === 'object' && typeof (value as { get?: unknown }).get === 'function') {
+    return plainConfigRecord((value as { get(): unknown }).get())
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return {}
+  return value as Record<string, T>
+}
+
+/** Stable key for a setting that belongs to one provider's model row. */
+export function modelSettingKey(variantId: string, modelId: string): string {
+  return `${variantId}:${modelId}`
+}
+
+function contextBudgetsFor(config: Config, variant: WorkBuddyVariant): Record<string, number> {
+  const prefix = `${variant.id}:`
+  return Object.fromEntries(
+    Object.entries(plainConfigRecord<number>(config.contextBudgets))
+      .filter(([key, value]) => key.startsWith(prefix) && Number.isSafeInteger(value) && value > 0)
+      .map(([key, value]) => [key.slice(prefix.length), value]),
+  )
+}
+
+function reasoningEffortFor(
+  config: Config,
+  variant: WorkBuddyVariant,
+  modelId: string,
+): WorkBuddyReasoningSelection | undefined {
+  const value = plainConfigRecord<WorkBuddyReasoningSelection>(config.reasoningEfforts)[modelSettingKey(variant.id, modelId)]
+  return value === 'default' || value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh' || value === 'max'
+    ? value
+    : undefined
+}
+
 /**
  * The CN side's settings section: only the fields that side edits.
  *
@@ -289,10 +343,12 @@ function plainConfigBoolean(value: unknown): boolean | undefined {
  * current code path (only manual, per-click-confirmed probes run), so it is left
  * where existing users set it rather than moved and re-asked.
  */
-const CN_SECTION: z<Config> = z.object({
+const CN_SECTION = z.object({
   authFile: AUTH_FILE_FIELD,
   probeConsent: PROBE_CONSENT_FIELD,
-})
+  contextBudgets: MODEL_CONTEXT_BUDGETS_FIELD,
+  reasoningEfforts: MODEL_REASONING_EFFORTS_FIELD,
+}) as unknown as z<Config>
 
 /** The international card's settings section and its context-window preference. */
 // The `.volatile()` marking makes the field's static default type
@@ -302,6 +358,8 @@ const CN_SECTION: z<Config> = z.object({
 const AI_SECTION = z.object({
   authFileAI: AUTH_FILE_AI_FIELD,
   useMaximumContextWindow: MAXIMUM_CONTEXT_WINDOW_FIELD,
+  contextBudgets: MODEL_CONTEXT_BUDGETS_FIELD,
+  reasoningEfforts: MODEL_REASONING_EFFORTS_FIELD,
 }) as unknown as z<Config>
 
 /** One variant's live runtime, assembled by {@link createVariantRuntime}. */
@@ -420,7 +478,9 @@ function createVariantRuntime(
   accountOf: (variantId: string) => string | undefined,
   keyProvider: WorkBuddyStoreOptions['keyProvider'],
 ): VariantRuntime {
-  const client = new WorkBuddyUpstreamClient()
+  const client = new WorkBuddyUpstreamClient({
+    resolveContextMetadata: readCachedAppContextMetadata,
+  })
   const configured = configuredAuthFile(config, variant)
   const store = new WorkBuddyCredentialStore({
     variant,
@@ -431,6 +491,7 @@ function createVariantRuntime(
   const fallback = fallbackFor(variant)
   const catalog = new WorkBuddyCatalog(fallback)
   if (variant.id !== CN_VARIANT.id) catalog.setUseMaximumContextWindow(plainConfigBoolean(config.useMaximumContextWindow) === true)
+  catalog.setContextBudgets(contextBudgetsFor(current(), variant))
   // Start hidden: a variant must serve no models until an account has actually
   // been adopted, so a signed-out variant is empty rather than showing a roster
   // whose models could only fail. `adoptIdentity` is what reveals it, and it
@@ -558,9 +619,15 @@ function probeSection(runtime: VariantRuntime, consent: boolean): WorkBuddyWebPr
  *
  * @returns whether the provider registered.
  */
-async function startVariant(ctx: Context, runtime: VariantRuntime): Promise<boolean> {
+async function startVariant(ctx: Context, runtime: VariantRuntime, current: () => Config): Promise<boolean> {
   const { variant, store, client, catalog, probeService } = runtime
-  const shim = createWorkBuddyShim({ store, client, catalog, logger: ctx.logger })
+  const shim = createWorkBuddyShim({
+    store,
+    client,
+    catalog,
+    reasoningEffort: modelId => reasoningEffortFor(current(), variant, modelId),
+    logger: ctx.logger,
+  })
   try {
     await shim.ready
   } catch (error: unknown) {
@@ -696,6 +763,8 @@ export function apply(ctx: Context, config: Config): void {
   // service is optional (a headless profile serves no browser).
   const probeKey = createProbeKey()
   let setMaximumContextWindow: ((enabled: boolean) => Promise<{ state: string; reason?: string }>) | undefined
+  let setContextWindow: ((variantId: string, modelId: string, window: number) => Promise<{ state: string; reason?: string }>) | undefined
+  let setReasoningEffort: ((variantId: string, modelId: string, effort: string) => Promise<{ state: string; reason?: string }>) | undefined
   /**
    * Whether this host's settings service carries the 0.1.2-era section API.
    * Decided once, inside the `settings` inject: DSH 0.1.7 removed
@@ -799,6 +868,8 @@ export function apply(ctx: Context, config: Config): void {
         catalog: () => catalogSection(runtime),
         probe: () => probeSection(runtime, current().probeConsent === true),
         probeKey,
+        selectedReasoningEffort: modelId => reasoningEffortFor(current(), runtime.variant, modelId),
+        modelSettingsWritable: () => legacySettingsAvailable || settingsAvailable,
         // The full per-account hidden list — stale ids included — so the card's
         // checkboxes answer exactly what the picker filter reads. Absent (and
         // the card renders no controls) when no uid-keyed account is in effect.
@@ -827,6 +898,14 @@ export function apply(ctx: Context, config: Config): void {
           return result
         },
         clear: () => { runtime.probeStore.clear(); runtime.invalidate() },
+        setContextWindow: async (modelId, window) => {
+          if (setContextWindow === undefined) return { state: 'failed', reason: 'settings are unavailable' }
+          return setContextWindow(runtime.variant.id, modelId, window)
+        },
+        setReasoningEffort: async (modelId, effort) => {
+          if (setReasoningEffort === undefined) return { state: 'failed', reason: 'settings are unavailable' }
+          return setReasoningEffort(runtime.variant.id, modelId, effort)
+        },
         refresh: async () => {
           if (stopped) return { state: 'failed', reason: 'plugin is stopping' }
           // Re-read the credential first: the user pressed this because the list
@@ -951,15 +1030,28 @@ export function apply(ctx: Context, config: Config): void {
           ...sources.cn().probeConsent === undefined ? {} : { probeConsent: sources.cn().probeConsent },
           ...sources.ai().authFileAI === undefined ? {} : { authFileAI: sources.ai().authFileAI },
           ...aiMaximum === undefined ? {} : { useMaximumContextWindow: aiMaximum },
+          contextBudgets: {
+            ...plainConfigRecord<number>(sources.cn().contextBudgets),
+            ...plainConfigRecord<number>(sources.ai().contextBudgets),
+          },
+          reasoningEfforts: {
+            ...plainConfigRecord<WorkBuddyReasoningSelection>(sources.cn().reasoningEfforts),
+            ...plainConfigRecord<WorkBuddyReasoningSelection>(sources.ai().reasoningEfforts),
+          },
         }
       }
-      const applyMaximumContextWindow = (next: Config): void => {
-        const runtime = runtimes.find(candidate => candidate.variant.id !== CN_VARIANT.id)
-        if (runtime?.catalog.setUseMaximumContextWindow(next.useMaximumContextWindow === true)) runtime.invalidate()
+      const applyModelSettings = (next: Config): void => {
+        for (const runtime of runtimes) {
+          let changed = runtime.variant.id !== CN_VARIANT.id
+            ? runtime.catalog.setUseMaximumContextWindow(next.useMaximumContextWindow === true)
+            : false
+          if (runtime.catalog.setContextBudgets(contextBudgetsFor(next, runtime.variant))) changed = true
+          if (changed) runtime.invalidate()
+        }
       }
       const repointStores = (): void => {
         const next = merged()
-        applyMaximumContextWindow(next)
+        applyModelSettings(next)
         for (const runtime of runtimes) {
           runtime.store.setDesktopPath(configuredAuthFile(next, runtime.variant))
         }
@@ -979,6 +1071,39 @@ export function apply(ctx: Context, config: Config): void {
       // Calling it again would only repeat the work.
       setMaximumContextWindow = async enabled => {
         await legacy.update(WORKBUDDY_AI_SETTINGS_NS, { useMaximumContextWindow: enabled })
+        return { state: 'updated' }
+      }
+      setContextWindow = async (variantId, modelId, window) => {
+        const runtime = runtimes.find(candidate => candidate.variant.id === variantId)
+        const model = runtime?.catalog.current().find(candidate => candidate.id === modelId)
+        if (runtime === undefined || model === undefined) return { state: 'failed', reason: 'unknown model' }
+        if (!(model.supportedContextWindows ?? []).includes(window)) {
+          return { state: 'failed', reason: 'context window not advertised for this model' }
+        }
+        const ns = runtime.variant.id === CN_VARIANT.id ? WORKBUDDY_SETTINGS_NS : WORKBUDDY_AI_SETTINGS_NS
+        const key = modelSettingKey(runtime.variant.id, modelId)
+        const next = { ...plainConfigRecord<number>(current().contextBudgets), [key]: window }
+        await legacy.update(ns, { contextBudgets: next })
+        applyModelSettings(current())
+        return { state: 'updated' }
+      }
+      setReasoningEffort = async (variantId, modelId, effort) => {
+        const runtime = runtimes.find(candidate => candidate.variant.id === variantId)
+        const model = runtime?.catalog.current().find(candidate => candidate.id === modelId)
+        if (runtime === undefined || model === undefined) return { state: 'failed', reason: 'unknown model' }
+        const observed = runtime.probeService.recordFor(modelId)
+        const available = model.reasoning?.supportedEfforts
+          ?? (observed?.validation === 'validating' ? observed.efforts : [])
+        if (effort !== 'default' && effort !== '' && !available.some(value => value === effort)) {
+          return { state: 'failed', reason: 'reasoning effort not advertised for this model' }
+        }
+        const ns = runtime.variant.id === CN_VARIANT.id ? WORKBUDDY_SETTINGS_NS : WORKBUDDY_AI_SETTINGS_NS
+        const key = modelSettingKey(runtime.variant.id, modelId)
+        const next = { ...plainConfigRecord<WorkBuddyReasoningSelection>(current().reasoningEfforts) }
+        if (effort === '') delete next[key]
+        else next[key] = effort as WorkBuddyReasoningSelection
+        await legacy.update(ns, { reasoningEfforts: next })
+        runtime.invalidate()
         return { state: 'updated' }
       }
       return
@@ -1038,11 +1163,15 @@ export function apply(ctx: Context, config: Config): void {
        */
       const applyModernConfig = (): void => {
         if (!liveConfigBound) return
-        const runtime = runtimes.find(candidate => candidate.variant.id !== CN_VARIANT.id)
-        // `plainConfigBoolean` guards against a wrapper sneaking into
-        // liveConfig from a future code path — a raw `=== true` on a volatile
-        // container reads false and would silently shrink the window.
-        if (runtime?.catalog.setUseMaximumContextWindow(plainConfigBoolean(liveConfig.useMaximumContextWindow) === true)) runtime.invalidate()
+        for (const runtime of runtimes) {
+          // `plainConfigBoolean` guards against a wrapper sneaking into
+          // liveConfig from a future code path.
+          let changed = runtime.variant.id !== CN_VARIANT.id
+            ? runtime.catalog.setUseMaximumContextWindow(plainConfigBoolean(liveConfig.useMaximumContextWindow) === true)
+            : false
+          if (runtime.catalog.setContextBudgets(contextBudgetsFor(liveConfig, runtime.variant))) changed = true
+          if (changed) runtime.invalidate()
+        }
       }
 
       setMaximumContextWindow = async enabled => {
@@ -1072,6 +1201,53 @@ export function apply(ctx: Context, config: Config): void {
         liveConfig = { ...liveConfig, useMaximumContextWindow: enabled }
         current = () => liveConfig
         applyModernConfig()
+        return { state: 'updated' }
+      }
+      setContextWindow = async (variantId, modelId, window) => {
+        const runtime = runtimes.find(candidate => candidate.variant.id === variantId)
+        const model = runtime?.catalog.current().find(candidate => candidate.id === modelId)
+        if (runtime === undefined || model === undefined) return { state: 'failed', reason: 'unknown model' }
+        if (!(model.supportedContextWindows ?? []).includes(window)) {
+          return { state: 'failed', reason: 'context window not advertised for this model' }
+        }
+        const ns = settingsEntryId()
+        if (ns === undefined) return { state: 'failed', reason: 'no configurable settings entry for this plugin' }
+        const key = modelSettingKey(runtime.variant.id, modelId)
+        const next = { ...plainConfigRecord<number>(liveConfig.contextBudgets), [key]: window }
+        try {
+          await modern.update(ns, { contextBudgets: next })
+        } catch (error: unknown) {
+          return { state: 'failed', reason: error instanceof Error ? error.message.slice(0, 300) : String(error) }
+        }
+        liveConfig = { ...liveConfig, contextBudgets: next }
+        current = () => liveConfig
+        applyModernConfig()
+        return { state: 'updated' }
+      }
+      setReasoningEffort = async (variantId, modelId, effort) => {
+        const runtime = runtimes.find(candidate => candidate.variant.id === variantId)
+        const model = runtime?.catalog.current().find(candidate => candidate.id === modelId)
+        if (runtime === undefined || model === undefined) return { state: 'failed', reason: 'unknown model' }
+        const observed = runtime.probeService.recordFor(modelId)
+        const available = model.reasoning?.supportedEfforts
+          ?? (observed?.validation === 'validating' ? observed.efforts : [])
+        if (effort !== 'default' && effort !== '' && !available.some(value => value === effort)) {
+          return { state: 'failed', reason: 'reasoning effort not advertised for this model' }
+        }
+        const ns = settingsEntryId()
+        if (ns === undefined) return { state: 'failed', reason: 'no configurable settings entry for this plugin' }
+        const key = modelSettingKey(runtime.variant.id, modelId)
+        const next = { ...plainConfigRecord<WorkBuddyReasoningSelection>(liveConfig.reasoningEfforts) }
+        if (effort === '') delete next[key]
+        else next[key] = effort as WorkBuddyReasoningSelection
+        try {
+          await modern.update(ns, { reasoningEfforts: next })
+        } catch (error: unknown) {
+          return { state: 'failed', reason: error instanceof Error ? error.message.slice(0, 300) : String(error) }
+        }
+        liveConfig = { ...liveConfig, reasoningEfforts: next }
+        current = () => liveConfig
+        runtime.invalidate()
         return { state: 'updated' }
       }
 
@@ -1282,7 +1458,7 @@ export function apply(ctx: Context, config: Config): void {
     for (const runtime of runtimes) await syncVariant(runtime)
   }
 
-  void Promise.all(runtimes.map(async runtime => startVariant(ctx, runtime))).then(() => {
+  void Promise.all(runtimes.map(async runtime => startVariant(ctx, runtime, () => current()))).then(() => {
     if (stopped) return
     // The host bundle is live: write a heartbeat so the status CLI can report
     // host health without a browser. Cleared on disposal; a stale heartbeat

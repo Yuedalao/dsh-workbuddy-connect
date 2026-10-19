@@ -52,6 +52,10 @@ export interface WorkBuddyProbeRouteOptions {
   refresh?: () => Promise<{ state: string; reason?: string }>
   /** Persist and apply the international context-window preference. */
   setMaximumContextWindow?: (enabled: boolean) => Promise<{ state: string; reason?: string }>
+  /** Persist one model's selected DSH context budget. */
+  setContextWindow?: (modelId: string, window: number) => Promise<{ state: string; reason?: string }>
+  /** Persist one model's native effort, or clear it to follow DSH. */
+  setReasoningEffort?: (modelId: string, effort: string) => Promise<{ state: string; reason?: string }>
   /**
    * Hide or show one model in the picker for the signed-in account. The
    * handler refuses (with a reason, not a crash) when no account with a stable
@@ -121,6 +125,25 @@ function parseAction(text: string): WorkBuddyProbeAction | undefined {
     return typeof wrapped['enabled'] === 'boolean'
       ? { action: 'set-maximum-context-window', enabled: wrapped['enabled'] }
       : undefined
+  }
+  if (action === 'set-context-window') {
+    const model = wrapped['model']
+    const window = wrapped['window']
+    if (typeof model !== 'string' || model.trim() === '') return undefined
+    if (typeof window !== 'number' || !Number.isSafeInteger(window) || window <= 0) return undefined
+    return { action: 'set-context-window', model: model.trim(), window }
+  }
+  if (action === 'set-reasoning-effort') {
+    const model = wrapped['model']
+    const effort = wrapped['effort']
+    if (typeof model !== 'string' || model.trim() === '') return undefined
+    if (typeof effort !== 'string') return undefined
+    if (effort !== '' && !['default', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) return undefined
+    return {
+      action: 'set-reasoning-effort',
+      model: model.trim(),
+      effort: effort as Exclude<WorkBuddyProbeAction['effort'], undefined>,
+    }
   }
   if (action === 'set-model-visibility') {
     const model = wrapped['model']
@@ -192,6 +215,22 @@ export function workBuddyProbeHandler(
           return
         }
         json(res, 200, await deps.setMaximumContextWindow(action.enabled === true))
+        return
+      }
+      if (action.action === 'set-context-window') {
+        if (deps.setContextWindow === undefined) {
+          json(res, 404, { error: 'context-window-setting-not-supported' })
+          return
+        }
+        json(res, 200, await deps.setContextWindow(action.model as string, action.window as number))
+        return
+      }
+      if (action.action === 'set-reasoning-effort') {
+        if (deps.setReasoningEffort === undefined) {
+          json(res, 404, { error: 'reasoning-setting-not-supported' })
+          return
+        }
+        json(res, 200, await deps.setReasoningEffort(action.model as string, action.effort as string))
         return
       }
       if (action.action === 'set-model-visibility') {

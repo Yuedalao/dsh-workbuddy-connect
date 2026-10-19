@@ -245,6 +245,17 @@ const quotaLabelStyle: CSSProperties = { display: 'flex', justifyContent: 'space
 const modelBadgeStyle: CSSProperties = { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }
 const modelOfferStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 2 }
 const modelRateStyle: CSSProperties = { fontSize: 12, lineHeight: '18px', color: 'var(--dsw-alias-label-tertiary)' }
+const modelSelectStyle: CSSProperties = {
+  minWidth: 86,
+  height: 28,
+  border: '1px solid var(--dsw-alias-border-l2)',
+  borderRadius: 6,
+  background: 'var(--dsw-alias-bg-layer-2)',
+  color: 'var(--dsw-alias-label-primary)',
+  font: 'inherit',
+  fontSize: 12,
+  padding: '0 6px',
+}
 const contextPreferenceStyle: CSSProperties = { display: 'flex', alignItems: 'flex-start', gap: 9, padding: '10px 12px', border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8, color: 'var(--dsw-alias-label-primary)', fontSize: 13, lineHeight: '20px' }
 const contextPreferenceCopyStyle: CSSProperties = { display: 'flex', flexDirection: 'column', gap: 2 }
 /**
@@ -630,21 +641,22 @@ function ModelOfferRow({ model, t }: {
  * plain capacity list rather than editing a bucket every such account would
  * share.
  *
- * Purely a report of the upstream's own numbers otherwise. The plugin offers
- * no tier picker: the CN catalog declares one capacity per model and publishes
- * no alternatives, so a menu there would mean inventing client-side policy.
- * The international document does declare alternatives (`supportedLengths`),
- * and they are shown as a secondary figure rather than merged into one number —
- * the default is the budget actually requested, while the larger value is a
- * ceiling the upstream would accept.
+ * Both product documents can declare alternatives (`supportedLengths`), and
+ * the card offers exactly those advertised values. The default remains the
+ * upstream's `defaultLength`; a larger row is a real selectable budget rather
+ * than a ceiling silently treated as the working window.
  */
-function ContextTable({ models, t, useMaximumContextWindow, contextPreferenceDisabled, onUseMaximumContextWindow, visibility, visibilityControlsDisabled, visibilityToggling, onVisibilityToggle }: {
+function ContextTable({ models, t, probe, modelSettingsWritable, useMaximumContextWindow, contextPreferenceDisabled, onUseMaximumContextWindow, onSetContextWindow, onSetReasoningEffort, visibility, visibilityControlsDisabled, visibilityToggling, onVisibilityToggle }: {
   models: readonly WorkBuddyWebModelBadge[] | undefined
   t: WorkBuddyPluginCardInjected['t']
+  probe?: WorkBuddyWebProbeSection | undefined
+  modelSettingsWritable?: boolean | undefined
   useMaximumContextWindow?: boolean
   /** Whether the maximum-context preference checkbox is locked (card `busy`). */
   contextPreferenceDisabled?: boolean
   onUseMaximumContextWindow?: (enabled: boolean) => void
+  onSetContextWindow?: (modelId: string, window: number) => void
+  onSetReasoningEffort?: (modelId: string, effort: string) => void
   /** Per-account hidden-model state; undefined renders no checkboxes. */
   visibility: WorkBuddyWebVisibilitySection | undefined
   /** Whether the visibility checkboxes are locked while other card actions run (`busy`). */
@@ -669,6 +681,7 @@ function ContextTable({ models, t, useMaximumContextWindow, contextPreferenceDis
   return (
     <div style={quotaListStyle}>
       <h3 style={quotaTitleStyle}>{t('contextHeading')}</h3>
+      {modelSettingsWritable === true ? <p style={bodyStyle}>{t('modelSettingsHint')}</p> : null}
       {/*
         * The preference is a policy about every row below it, not a row
         * itself: it keeps its own bordered label and stays above the list, so
@@ -697,6 +710,10 @@ function ContextTable({ models, t, useMaximumContextWindow, contextPreferenceDis
       <div style={quotaGroupStyle}>
         {rows.map(model => {
           const capacity = model.contextWindow
+          const contextOptions = model.supportedContextWindows ?? []
+          const observed = probe?.results.find(result => result.id === model.id)
+          const effortOptions = model.declaredEfforts
+            ?? (observed?.validation === 'validating' ? observed.efforts : [])
           // Only shown when the upstream declared a larger alternative, so the
           // CN list (which declares none) is unchanged.
           const alternative = capacity !== undefined && model.maxContextWindow !== undefined && model.maxContextWindow > capacity
@@ -730,15 +747,40 @@ function ContextTable({ models, t, useMaximumContextWindow, contextPreferenceDis
                     : <span style={modelRateStyle}>{model.credits}</span>}
                 </span>
               </span>
-              <span style={modelOfferStyle}>
+              <span style={{ ...modelOfferStyle, gap: 6 }}>
                 {capacity === undefined
                   ? <span style={modelRateStyle} aria-label={t('contextUnknown')}>—</span>
-                  : <span style={{ textAlign: 'right' }}>{formatTokens(capacity)}</span>}
+                  : contextOptions.length > 1 && modelSettingsWritable === true
+                    ? (
+                      <select
+                        aria-label={`${model.name} ${t('contextHeading')}`}
+                        style={modelSelectStyle}
+                        value={String(capacity)}
+                        disabled={contextPreferenceDisabled}
+                        onChange={event => { onSetContextWindow?.(model.id, Number(event.currentTarget.value)) }}
+                      >
+                        {contextOptions.map(value => <option key={value} value={String(value)}>{formatTokens(value)}</option>)}
+                      </select>
+                    )
+                    : <span style={{ textAlign: 'right' }}>{formatTokens(capacity)}</span>}
                 {alternative !== undefined
                   ? <span style={modelRateStyle}>{t('contextUpTo', { size: formatTokens(alternative) })}</span>
                   : capacity !== undefined && model.defaultContextWindow !== undefined && model.defaultContextWindow < capacity
                     ? <span style={modelRateStyle}>{t('contextDefault', { size: formatTokens(model.defaultContextWindow) })}</span>
                     : null}
+                {model.supportsReasoning === true ? (
+                  <select
+                    aria-label={`${model.name} ${t('reasoningChoice')}`}
+                    style={modelSelectStyle}
+                    value={model.selectedReasoningEffort ?? ''}
+                    disabled={modelSettingsWritable !== true || contextPreferenceDisabled}
+                    onChange={event => { onSetReasoningEffort?.(model.id, event.currentTarget.value) }}
+                  >
+                    <option value="">{t('reasoningFollowDsh')}</option>
+                    <option value="default">{t('reasoningUpstreamDefault')}</option>
+                    {effortOptions.map(value => <option key={value} value={value}>{value}</option>)}
+                  </select>
+                ) : null}
               </span>
             </label>
           )
@@ -1127,7 +1169,7 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
    * the host never accepts a prompt, a sentinel, or a model outside its own
    * catalog from here.
    */
-  const control = useCallback(async (action: { action: 'probe'; model: string } | { action: 'clear' } | { action: 'set-maximum-context-window'; enabled: boolean } | { action: 'set-model-visibility'; model: string; visible: boolean; account: string }): Promise<void> => {
+  const control = useCallback(async (action: { action: 'probe'; model: string } | { action: 'clear' } | { action: 'set-maximum-context-window'; enabled: boolean } | { action: 'set-context-window'; model: string; window: number } | { action: 'set-reasoning-effort'; model: string; effort: string } | { action: 'set-model-visibility'; model: string; visible: boolean; account: string }): Promise<void> => {
     const key = status?.status === 'signed-in' ? status.probeKey : undefined
     if (key === undefined) return
     // A visibility toggle runs on its own per-row in-flight set so the
@@ -1157,7 +1199,10 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
       // the host did not persist the toggle, and the checkbox must not be left
       // claiming it did — the thrown reason lands beside the list and the
       // document's next read restores the honest state.
-      if ((action.action === 'set-maximum-context-window' || action.action === 'set-model-visibility')
+      if ((action.action === 'set-maximum-context-window'
+        || action.action === 'set-context-window'
+        || action.action === 'set-reasoning-effort'
+        || action.action === 'set-model-visibility')
         && (typeof value !== 'object' || value === null || (value as Record<string, unknown>)['state'] !== 'updated')) {
         const state = typeof value === 'object' && value !== null ? (value as Record<string, unknown>)['state'] : undefined
         // A stale write (the account switched under the open card) is its own
@@ -1386,8 +1431,16 @@ export function WorkBuddyPluginCard({ t, variant = CN_CARD_VARIANT }: WorkBuddyP
                         */}
                       <ContextTable
                         models={status.models}
+                        probe={status.probe}
                         t={t}
+                        modelSettingsWritable={status.modelSettingsWritable}
                         contextPreferenceDisabled={busy}
+                        onSetContextWindow={(modelId, window) => {
+                          void control({ action: 'set-context-window', model: modelId, window })
+                        }}
+                        onSetReasoningEffort={(modelId, effort) => {
+                          void control({ action: 'set-reasoning-effort', model: modelId, effort })
+                        }}
                         {...variant.id === AI_CARD_VARIANT.id && status.useMaximumContextWindow !== undefined
                           ? {
                             useMaximumContextWindow: status.useMaximumContextWindow,

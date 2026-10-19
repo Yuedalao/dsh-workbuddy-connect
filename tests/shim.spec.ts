@@ -51,7 +51,10 @@ function rawRequest(options: {
   })
 }
 
-async function startShim(upstreamResponse: () => WorkBuddyChatResult): Promise<Harness> {
+async function startShim(
+  upstreamResponse: () => WorkBuddyChatResult,
+  reasoningEffort?: (modelId: string) => 'default' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | undefined,
+): Promise<Harness> {
   const dir = await mkdtemp(join(tmpdir(), 'wb-shim-'))
   CLEANUP.push(() => rm(dir, { recursive: true, force: true }))
   const desktop = join(dir, 'workbuddy-desktop.info')
@@ -73,6 +76,7 @@ async function startShim(upstreamResponse: () => WorkBuddyChatResult): Promise<H
   harness.shim = createWorkBuddyShim({
     store,
     catalog: new WorkBuddyCatalog(),
+    ...reasoningEffort === undefined ? {} : { reasoningEffort },
     client: {
       async chatStream(_credential, bodyJson): Promise<WorkBuddyChatResult> {
         harness.upstreamBodies.push(bodyJson)
@@ -152,6 +156,36 @@ describe('WorkBuddy shim', () => {
     const forwarded = JSON.parse(harness.upstreamBodies[0] ?? '') as Record<string, unknown>
     expect(forwarded['reasoning_effort']).toBe('xhigh')
     expect(forwarded['stream']).toBe(true)
+  })
+
+  it('applies or clears the card-selected native effort before forwarding', async () => {
+    let selected: 'default' | 'high' = 'default'
+    const harness = await startShim(
+      () => ({
+        ok: true,
+        response: new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        }),
+      }),
+      model => model === 'glm-5.3' ? selected : undefined,
+    )
+    const send = async (): Promise<Record<string, unknown>> => {
+      const response = await fetch(`${harness.shim.baseUrl()}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', authorization: `Bearer ${harness.shim.token()}` },
+        body: JSON.stringify({
+          model: 'glm-5.3',
+          messages: [{ role: 'user', content: 'hi' }],
+          reasoning_effort: 'medium',
+        }),
+      })
+      expect(response.status).toBe(200)
+      return JSON.parse(harness.upstreamBodies.at(-1) ?? '') as Record<string, unknown>
+    }
+    expect('reasoning_effort' in await send()).toBe(false)
+    selected = 'high'
+    expect((await send())['reasoning_effort']).toBe('high')
   })
 
   it('maps an upstream credit failure onto HTTP 402', async () => {

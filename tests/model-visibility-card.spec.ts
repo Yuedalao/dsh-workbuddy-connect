@@ -332,6 +332,60 @@ describe('model visibility card controls', () => {
     expect(posts[0]!.body['action']).toBe('set-model-visibility')
   })
 
+  it('lets one model choose its context window and native effort', async () => {
+    signedIn({
+      modelSettingsWritable: true,
+      models: [{
+        id: 'step-5-preview',
+        name: 'Step-5-Preview',
+        contextWindow: 300_000,
+        defaultContextWindow: 300_000,
+        maxContextWindow: 1_000_000,
+        supportedContextWindows: [300_000, 1_000_000],
+        supportsReasoning: true,
+        declaredEfforts: ['low', 'medium', 'high'],
+        selectedReasoningEffort: 'high',
+      }],
+    })
+    request.mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method !== 'POST') return { ok: true, json: async () => statusBody }
+      const action = JSON.parse(String(init.body)) as Record<string, unknown>
+      posts.push({ body: action, headers: init.headers })
+      if (action['action'] === 'set-context-window') {
+        statusBody = {
+          ...statusBody,
+          models: [{ ...(statusBody.models as Record<string, unknown>[])[0], contextWindow: action['window'] }],
+        }
+      } else if (action['action'] === 'set-reasoning-effort') {
+        statusBody = {
+          ...statusBody,
+          models: [{ ...(statusBody.models as Record<string, unknown>[])[0], selectedReasoningEffort: action['effort'] || undefined }],
+        }
+      }
+      return { ok: true, json: async () => ({ state: 'updated' }) }
+    })
+    await mount()
+    const selects = view!.root.findAllByType('select')
+    expect(selects).toHaveLength(2)
+    await act(async () => {
+      selects[0]!.props.onChange({ currentTarget: { value: '1000000' } })
+    })
+    expect(posts[0]!.body).toEqual({
+      action: 'set-context-window',
+      model: 'step-5-preview',
+      window: 1_000_000,
+    })
+    const nextSelects = view!.root.findAllByType('select')
+    await act(async () => {
+      nextSelects[1]!.props.onChange({ currentTarget: { value: 'default' } })
+    })
+    expect(posts[1]!.body).toEqual({
+      action: 'set-reasoning-effort',
+      model: 'step-5-preview',
+      effort: 'default',
+    })
+  })
+
   it('a host that cannot persist the preference renders the rows but no maximum-context control', async () => {
     // DSH 0.1.7 has no settings section API, so the status document carries no
     // `useMaximumContextWindow` field. The card must degrade to NOT rendering

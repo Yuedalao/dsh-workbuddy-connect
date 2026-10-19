@@ -1,5 +1,7 @@
 /** Node-free constants and types shared by the Host and browser halves. */
 
+import type { WorkBuddyReasoningSelection } from './upstream.ts'
+
 /** Plugin-owned status endpoint consumed by its browser half. */
 export const WORKBUDDY_STATUS_PATH = '/plugins/dsh-workbuddy-connect/status'
 
@@ -61,20 +63,26 @@ export interface WorkBuddyProbeAction {
   /**
    * `probe` spends credit on one model; `clear` drops recorded observations;
    * `refresh` re-reads the credential and re-fetches the model catalog;
-   * `set-maximum-context-window` persists the international card preference;
+   * `set-maximum-context-window` persists the legacy international preference;
+   * `set-context-window` and `set-reasoning-effort` persist one model's card
+   * choices;
    * `set-model-visibility` hides or shows one model for the signed-in
    * account's picker.
    *
-   * All five are writes, which is why they share this route's in-process key
+   * All writes share this route's in-process key
    * and loopback guards rather than the read-only status GET.
    */
-  action: 'probe' | 'clear' | 'refresh' | 'set-maximum-context-window' | 'set-model-visibility'
-  /** Target model id; required for `probe` and `set-model-visibility`. */
+  action: 'probe' | 'clear' | 'refresh' | 'set-maximum-context-window' | 'set-context-window' | 'set-reasoning-effort' | 'set-model-visibility'
+  /** Target model id for model-scoped actions. */
   model?: string
   /** Requested value for `set-maximum-context-window` and `set-model-visibility`. */
   enabled?: boolean
   /** Requested picker visibility for `set-model-visibility`. */
   visible?: boolean
+  /** Requested DSH context budget for `set-context-window`. */
+  window?: number
+  /** `default`, a declared effort, or the empty string for "follow DSH". */
+  effort?: WorkBuddyReasoningSelection | ''
   /**
    * Expected account key for `set-model-visibility`: the `visibility.account`
    * the card rendered its checkboxes from. The host refuses the write when the
@@ -205,8 +213,12 @@ export interface WorkBuddyWebModelBadge {
    * useful.
    */
   declaredEfforts?: readonly string[]
+  /** Whether the model performs reasoning and can expose an effort control. */
+  supportsReasoning?: boolean
   /** The level the upstream applies when a request names none. */
   defaultEffort?: string
+  /** The native effort fixed by the plugin card; absent means follow DSH. */
+  selectedReasoningEffort?: WorkBuddyReasoningSelection
   /**
    * Context capacity in tokens, taken verbatim from the upstream
    * `maxAllowedSize`/`maxInputTokens`, or from the international document's
@@ -228,6 +240,8 @@ export interface WorkBuddyWebModelBadge {
    * ceiling as though it were the working window would overstate the budget.
    */
   maxContextWindow?: number
+  /** Every window the upstream declares for this model. */
+  supportedContextWindows?: readonly number[]
   maxInputTokens?: number
 }
 
@@ -305,6 +319,8 @@ export type WorkBuddyWebStatus =
     useMaximumContextWindow?: boolean
     /** Per-account hidden-model state for the card's visibility controls. */
     visibility?: WorkBuddyWebVisibilitySection
+    /** Whether the host can persist model context/effort choices. */
+    modelSettingsWritable?: boolean
     /**
      * In-process key authorizing probe control writes. Handed to the card with
      * the status document (the card is same-origin and already had to pass the

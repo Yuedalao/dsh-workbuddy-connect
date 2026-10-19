@@ -8,6 +8,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { appUserAgent, resolveAppVersion, type AppVersionInfo } from './app-version.ts'
 import { chatUserAgent, fallbackChatIdentity, resolveChatIdentity, type ChatIdentity } from './client-identity.ts'
 import type { WorkBuddyCredential } from './auth.ts'
@@ -16,6 +19,12 @@ import { PROBE_MAX_TOKENS, PROBE_PROMPT } from './probe.ts'
 
 /** WorkBuddy region selected by the credential's login domain. */
 export type WorkBuddyRegion = 'cn' | 'global'
+
+/** Context options declared by the desktop app's cached product document. */
+export interface WorkBuddyContextMetadata {
+  defaultContextWindow?: number
+  supportedContextWindows?: readonly number[]
+}
 
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
 export type UpstreamErrorKind =
@@ -80,6 +89,8 @@ export interface WorkBuddyModelReasoning {
 
 /** The concrete effort spellings WorkBuddy exposes on the wire. */
 export type WorkBuddyEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+/** Plugin-card choice: an explicit upstream effort, or omission for its default. */
+export type WorkBuddyReasoningSelection = 'default' | WorkBuddyEffort
 
 /** Billing convenience metadata reported for one model. */
 export interface WorkBuddyModelBilling {
@@ -569,6 +580,32 @@ export function prepareChatBody(source: string): string {
   return JSON.stringify(obj)
 }
 
+/**
+ * Apply a per-model card choice before the shared wire normalisation.
+ *
+ * `default` means "omit `reasoning_effort`", which lets WorkBuddy use that
+ * model's own `defaultEffort`. Any other value is a declared upstream spelling.
+ */
+export function applyReasoningEffortOverride(
+  source: string,
+  resolve: (modelId: string) => WorkBuddyReasoningSelection | undefined,
+): string {
+  let body: unknown
+  try {
+    body = JSON.parse(source)
+  } catch {
+    return source
+  }
+  if (!isObject(body)) return source
+  const model = body['model']
+  if (typeof model !== 'string' || model === '') return source
+  const selected = resolve(model)
+  if (selected === undefined) return source
+  if (selected === 'default') delete body['reasoning_effort']
+  else body['reasoning_effort'] = selected
+  return JSON.stringify(body)
+}
+
 /** Rewrite `role: "developer"` messages to `role: "system"` (upstream rejects developer). */
 function normalizeDeveloperRole(obj: Record<string, unknown>): void {
   const messages = obj['messages']
@@ -683,6 +720,8 @@ export interface WorkBuddyUpstreamClientOptions {
    * billing never consult it — those requests keep their long-standing headers.
    */
   resolveChatIdentity?: (region: WorkBuddyRegion) => Promise<ChatIdentity>
+  /** Read-only app-cache supplement for CN context alternatives. */
+  resolveContextMetadata?: () => Promise<ReadonlyMap<string, WorkBuddyContextMetadata>>
 }
 
 /**
@@ -808,6 +847,7 @@ export class WorkBuddyUpstreamClient {
   private readonly resolveAppVersion: () => Promise<AppVersionInfo>
   /** Chat-identity resolver; see {@link WorkBuddyUpstreamClientOptions.resolveChatIdentity}. */
   private readonly resolveChatIdentity: (region: WorkBuddyRegion) => Promise<ChatIdentity>
+  private readonly resolveContextMetadata: () => Promise<ReadonlyMap<string, WorkBuddyContextMetadata>>
 
   /** Provenance of the most recent successful catalog fetch, for the card. */
   lastCatalog: WorkBuddyCatalogFetch | undefined
@@ -815,6 +855,7 @@ export class WorkBuddyUpstreamClient {
   constructor(options: WorkBuddyUpstreamClientOptions = {}) {
     this.resolveAppVersion = options.resolveAppVersion ?? (() => resolveAppVersion())
     this.resolveChatIdentity = options.resolveChatIdentity ?? (region => resolveChatIdentity(region))
+    this.resolveContextMetadata = options.resolveContextMetadata ?? (async () => new Map())
   }
 
   /** POST the chat endpoint; a successful answer is the raw SSE response. */
@@ -948,7 +989,20 @@ export class WorkBuddyUpstreamClient {
     // The read is best-effort and separate: its failure costs the badges and
     // never the catalog.
     const promoBadges = international ? undefined : await this.fetchPromoBadges(credential, signal)
-    const models = parseModelCatalog(data, international, promoBadges)
+    let models = parseModelCatalog(data, international, promoBadges)
+    if (!international) {
+      const contextMetadata = await this.resolveContextMetadata()
+      models = models.map(model => {
+        const metadata = contextMetadata.get(model.id)
+        if (metadata === undefined) return model
+        return {
+          ...model,
+          ...metadata.defaultContextWindow === undefined ? {} : { defaultContextWindow: metadata.defaultContextWindow },
+          ...metadata.defaultContextWindow === undefined ? {} : { contextWindow: metadata.defaultContextWindow },
+          ...metadata.supportedContextWindows === undefined ? {} : { supportedContextWindows: metadata.supportedContextWindows },
+        }
+      })
+    }
     this.lastCatalog = {
       fetchedAtMs: Date.now(),
       source: international ? 'workbuddy-ai:app' : 'workbuddy:cli',
@@ -1349,19 +1403,21 @@ export function parseModelCatalog(
       const input = typeof wrapped['maxInputTokens'] === 'number' ? wrapped['maxInputTokens'] : 0
       const output = typeof wrapped['maxOutputTokens'] === 'number' ? wrapped['maxOutputTokens'] : 0
       if (input <= 0 || output <= 0) continue
+      const context = isObject(wrapped['contextWindow']) ? wrapped['contextWindow'] : undefined
+      const defaultLength = context !== undefined && positive(context['defaultLength']) ? context['defaultLength'] : undefined
+      const supportedLengths = context !== undefined && Array.isArray(context['supportedLengths'])
+        ? [...new Set(context['supportedLengths'].filter(positive))].sort((left, right) => left - right)
+        : []
       byId.set(id, {
         id,
         name: typeof wrapped['name'] === 'string' && wrapped['name'] !== '' ? wrapped['name'] : id,
-        contextWindow: international && isObject(wrapped['contextWindow']) && positive(wrapped['contextWindow']['defaultLength'])
-          ? wrapped['contextWindow']['defaultLength'] : input,
-        ...(international ? {
-          ...isObject(wrapped['contextWindow']) && positive(wrapped['contextWindow']['defaultLength'])
-            ? { defaultContextWindow: wrapped['contextWindow']['defaultLength'] } : {},
+        contextWindow: defaultLength ?? input,
+        ...defaultLength === undefined ? {} : { defaultContextWindow: defaultLength },
+        ...supportedLengths.length === 0 ? {} : { supportedContextWindows: supportedLengths },
+        ...international ? {
           maxInputTokens: input,
-          supportedContextWindows: isObject(wrapped['contextWindow']) && Array.isArray(wrapped['contextWindow']['supportedLengths'])
-            ? wrapped['contextWindow']['supportedLengths'].filter(positive) : [],
           promotions: parsePromotions(data['modelPromotions'], id),
-        } : {}),
+        } : {},
         maxTokens: output,
         supportsImages: wrapped['supportsImages'] === true && wrapped['disabledMultimodal'] !== true,
         ...resolveUpstreamReasoning(wrapped),
@@ -1373,6 +1429,46 @@ export function parseModelCatalog(
       .filter((model): model is WorkBuddyUpstreamModel => model !== undefined)
     if (models.length === 0) throw new Error('workbuddy model catalog resolved to an empty list')
     return disambiguateDisplayNames(models)
+}
+
+/**
+ * Read context alternatives from the desktop app's cached `/v3/config`.
+ *
+ * The CLI-shaped response used for the callable roster can omit the
+ * `contextWindow` object even when the desktop picker renders its choices.
+ * This file is a read-only, best-effort supplement; it never contributes
+ * model membership, credentials, or request headers.
+ */
+export async function readCachedAppContextMetadata(
+  path = process.env['WORKBUDDY_APP_CONFIG_CACHE']
+    ?? join(homedir(), '.workbuddy', 'cache', 'acc-product-config-v3.json'),
+): Promise<ReadonlyMap<string, WorkBuddyContextMetadata>> {
+  let document: unknown
+  try {
+    document = JSON.parse(await readFile(path, 'utf8'))
+  } catch {
+    return new Map()
+  }
+  if (!isObject(document)) return new Map()
+  const data = isObject(document['data']) ? document['data'] : document
+  const rows = Array.isArray(data['models']) ? data['models'] : []
+  const result = new Map<string, WorkBuddyContextMetadata>()
+  for (const row of rows) {
+    if (!isObject(row) || typeof row['id'] !== 'string' || row['id'] === '') continue
+    const context = isObject(row['contextWindow']) ? row['contextWindow'] : undefined
+    const defaultContextWindow = context !== undefined && positive(context['defaultLength'])
+      ? context['defaultLength']
+      : undefined
+    const supportedContextWindows = context !== undefined && Array.isArray(context['supportedLengths'])
+      ? [...new Set(context['supportedLengths'].filter(positive))].sort((left, right) => left - right)
+      : []
+    if (defaultContextWindow === undefined && supportedContextWindows.length === 0) continue
+    result.set(row['id'], {
+      ...defaultContextWindow === undefined ? {} : { defaultContextWindow },
+      ...supportedContextWindows.length === 0 ? {} : { supportedContextWindows },
+    })
+  }
+  return result
 }
 
 /**

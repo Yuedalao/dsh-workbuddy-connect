@@ -123,6 +123,39 @@ describe('context capacity reporting', () => {
     // A non-positive capacity is not reported rather than shown as "0".
     expect(body.models?.find(model => model.id === 'broken')?.contextWindow).toBeUndefined()
   })
+
+  it('reports every selectable window and the fixed native effort', async () => {
+    const port = await startStatusServer({
+      models: () => [{
+        id: 'step-5-preview',
+        name: 'Step-5-Preview',
+        contextWindow: 1_000_000,
+        defaultContextWindow: 300_000,
+        supportedContextWindows: [300_000, 1_000_000],
+        maxTokens: 64_000,
+        supportsImages: true,
+        reasoning: { supports: true, onlyReasoning: true, supportedEfforts: ['low', 'medium', 'high'], defaultEffort: 'high', canDisableThinking: false },
+      }],
+      probe: () => ({ consent: true, running: false, candidates: [], results: [] }),
+      selectedReasoningEffort: model => model === 'step-5-preview' ? 'medium' : undefined,
+      modelSettingsWritable: () => true,
+    })
+    const response = await requestOnce({ port, method: 'GET', headers: { host: `127.0.0.1:${String(port)}` } })
+    const body = JSON.parse(response.body) as {
+      modelSettingsWritable?: boolean
+      models?: readonly {
+        supportedContextWindows?: readonly number[]
+        selectedReasoningEffort?: string
+        supportsReasoning?: boolean
+      }[]
+    }
+    expect(body.modelSettingsWritable).toBe(true)
+    expect(body.models?.[0]).toMatchObject({
+      supportedContextWindows: [300_000, 1_000_000],
+      selectedReasoningEffort: 'medium',
+      supportsReasoning: true,
+    })
+  })
 })
 
 describe('web status route gate', () => {

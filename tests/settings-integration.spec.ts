@@ -348,7 +348,12 @@ describe('WorkBuddy Host settings integration', () => {
     }
     expect(fieldsOf('workbuddy')).toContain('authFile')
     expect(fieldsOf('workbuddy')).not.toContain('authFileAI')
-    expect(fieldsOf('workbuddy-ai')).toEqual(['authFileAI', 'useMaximumContextWindow'])
+    expect(fieldsOf('workbuddy-ai')).toEqual([
+      'authFileAI',
+      'useMaximumContextWindow',
+      'contextBudgets',
+      'reasoningEfforts',
+    ])
 
     // A write through one section must reach ONLY that variant's store. The
     // schema assertions above prove the two forms are split; this proves the

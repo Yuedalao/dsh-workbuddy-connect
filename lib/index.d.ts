@@ -4,33 +4,6 @@ import { PiAiAdapter, PiAiAdapterOptions } from "@deepseek-ai/dsh-llm-pi-ai";
 import { Context } from "@deepseek-ai/cordis";
 import { SettingsNamespace } from "@deepseek-ai/dsh-settings";
 import { AttachmentStore } from "@deepseek-ai/dsh-attachment";
-//#region src/status-paths.d.ts
-/**
- * Why no credential is usable, as a closed enum the browser half switches on.
- *
- * Deliberately separate from `reason`: `reason` is free text meant for a human
- * to read, so matching on it would break the moment the wording changes. This
- * is the machine-readable half, and the card uses it — never a substring of
- * `reason` — to decide whether the Agent assist block applies.
- */
-type WorkBuddySignedOutReasonCode =
-/** Nobody is signed in; nothing diagnosable beyond that. */
-'no-credential' |
-/** A credential for the *other* product was found in this variant's file. */
-'credential-region-mismatch' |
-/** An encrypted credential exists but could not be opened (wrong key, GCM failure, helper crash). */
-'encrypted-credential-unreadable' |
-/** A product on a supported platform: discovery ran to completion and found no usable candidate. */
-'electron-binary-not-found' |
-/** A product on a supported platform: discovery found more than one distinct usable app. */
-'electron-binary-ambiguous' |
-/** No auto-discovery for this product/platform and no explicit path configured. */
-'electron-binary-unavailable' |
-/** An explicit path (option or env) is set but missing or not executable. */
-'electron-path-invalid' |
-/** Discovery could not finish: tool missing, timeout, output overflow, unreadable plist. */
-'electron-discovery-incomplete';
-//#endregion
 //#region src/app-version.d.ts
 /** Basename of the saved version under `$DSH_HOME`. */
 declare const WORKBUDDY_APP_VERSION_FILENAME = ".workbuddy-ai-version.json";
@@ -250,6 +223,11 @@ declare function probeModel(options: {
 //#region src/upstream.d.ts
 /** WorkBuddy region selected by the credential's login domain. */
 type WorkBuddyRegion = 'cn' | 'global';
+/** Context options declared by the desktop app's cached product document. */
+interface WorkBuddyContextMetadata {
+  defaultContextWindow?: number;
+  supportedContextWindows?: readonly number[];
+}
 /** Upstream failure classes the shim maps onto distinct HTTP answers. */
 type UpstreamErrorKind = 'hard_credit' | 'soft_rate' | 'session_dead' | 'not_found' | 'server' | 'client';
 /** One CLI-usable model as the upstream catalog describes it. */
@@ -304,6 +282,8 @@ interface WorkBuddyModelReasoning {
 }
 /** The concrete effort spellings WorkBuddy exposes on the wire. */
 type WorkBuddyEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+/** Plugin-card choice: an explicit upstream effort, or omission for its default. */
+type WorkBuddyReasoningSelection = 'default' | WorkBuddyEffort;
 /** Billing convenience metadata reported for one model. */
 interface WorkBuddyModelBilling {
   /** Credits multiplier, e.g. `"x0.00"` (free) or `"x0.79"`. */
@@ -447,6 +427,13 @@ declare function regionOf(domain: string): WorkBuddyRegion;
  * compatible spelling the upstream accepts.
  */
 declare function prepareChatBody(source: string): string;
+/**
+ * Apply a per-model card choice before the shared wire normalisation.
+ *
+ * `default` means "omit `reasoning_effort`", which lets WorkBuddy use that
+ * model's own `defaultEffort`. Any other value is a declared upstream spelling.
+ */
+declare function applyReasoningEffortOverride(source: string, resolve: (modelId: string) => WorkBuddyReasoningSelection | undefined): string;
 /** Provenance of one successful catalog fetch, surfaced by the status card. */
 interface WorkBuddyCatalogFetch {
   fetchedAtMs: number;
@@ -465,6 +452,8 @@ interface WorkBuddyUpstreamClientOptions {
    * billing never consult it — those requests keep their long-standing headers.
    */
   resolveChatIdentity?: (region: WorkBuddyRegion) => Promise<ChatIdentity>;
+  /** Read-only app-cache supplement for CN context alternatives. */
+  resolveContextMetadata?: () => Promise<ReadonlyMap<string, WorkBuddyContextMetadata>>;
 }
 /**
  * Upstream HTTP client. One instance serves the whole plugin; requests take
@@ -482,6 +471,7 @@ declare class WorkBuddyUpstreamClient {
   private readonly resolveAppVersion;
   /** Chat-identity resolver; see {@link WorkBuddyUpstreamClientOptions.resolveChatIdentity}. */
   private readonly resolveChatIdentity;
+  private readonly resolveContextMetadata;
   /** Provenance of the most recent successful catalog fetch, for the card. */
   lastCatalog: WorkBuddyCatalogFetch | undefined;
   constructor(options?: WorkBuddyUpstreamClientOptions);
@@ -619,6 +609,15 @@ declare class WorkBuddyUpstreamClient {
  */
 declare function parseModelCatalog(data: Record<string, unknown>, international?: boolean, promoBadges?: ReadonlyMap<string, readonly string[]>): readonly WorkBuddyUpstreamModel[];
 /**
+ * Read context alternatives from the desktop app's cached `/v3/config`.
+ *
+ * The CLI-shaped response used for the callable roster can omit the
+ * `contextWindow` object even when the desktop picker renders its choices.
+ * This file is a read-only, best-effort supplement; it never contributes
+ * model membership, credentials, or request headers.
+ */
+declare function readCachedAppContextMetadata(path?: string): Promise<ReadonlyMap<string, WorkBuddyContextMetadata>>;
+/**
  * One verified promotion entry.
  *
  * Only the shape actually observed in the international App document is
@@ -683,6 +682,33 @@ declare function modelWithCurrentPromotion(model: WorkBuddyUpstreamModel, now?: 
  */
 declare function prepareCnChatBody(source: string): string;
 declare function prepareInternationalChatBody(source: string): string;
+//#endregion
+//#region src/status-paths.d.ts
+/**
+ * Why no credential is usable, as a closed enum the browser half switches on.
+ *
+ * Deliberately separate from `reason`: `reason` is free text meant for a human
+ * to read, so matching on it would break the moment the wording changes. This
+ * is the machine-readable half, and the card uses it — never a substring of
+ * `reason` — to decide whether the Agent assist block applies.
+ */
+type WorkBuddySignedOutReasonCode =
+/** Nobody is signed in; nothing diagnosable beyond that. */
+'no-credential' |
+/** A credential for the *other* product was found in this variant's file. */
+'credential-region-mismatch' |
+/** An encrypted credential exists but could not be opened (wrong key, GCM failure, helper crash). */
+'encrypted-credential-unreadable' |
+/** A product on a supported platform: discovery ran to completion and found no usable candidate. */
+'electron-binary-not-found' |
+/** A product on a supported platform: discovery found more than one distinct usable app. */
+'electron-binary-ambiguous' |
+/** No auto-discovery for this product/platform and no explicit path configured. */
+'electron-binary-unavailable' |
+/** An explicit path (option or env) is set but missing or not executable. */
+'electron-path-invalid' |
+/** Discovery could not finish: tool missing, timeout, output overflow, unreadable plist. */
+'electron-discovery-incomplete';
 //#endregion
 //#region src/variants.d.ts
 /** One WorkBuddy product variant. */
@@ -1188,6 +1214,7 @@ declare class WorkBuddyCatalog {
   private models;
   private visible;
   private useMaximumContextWindow;
+  private contextBudgets;
   constructor(initial?: readonly WorkBuddyModelInfo[]);
   /** Current entries; empty while the variant has no usable credential. */
   current(): readonly WorkBuddyModelInfo[];
@@ -1202,6 +1229,8 @@ declare class WorkBuddyCatalog {
   setVisible(visible: boolean): boolean;
   /** Select the largest declared international window where the upstream offers one. */
   setUseMaximumContextWindow(useMaximum: boolean): boolean;
+  /** Select advertised per-model windows; unknown ids/values are ignored. */
+  setContextBudgets(budgets: Readonly<Record<string, number>>): boolean;
   /** Models to fall back to when the upstream fetch fails; ignores visibility. */
   fallback(): readonly WorkBuddyModelInfo[];
 }
@@ -1345,6 +1374,8 @@ interface WorkBuddyShimOptions {
   store: WorkBuddyCredentialStore;
   client: Pick<WorkBuddyUpstreamClient, 'chatStream'>;
   catalog: WorkBuddyCatalog;
+  /** Card-selected effort for one model; `default` omits the wire field. */
+  reasoningEffort?: (modelId: string) => WorkBuddyReasoningSelection | undefined;
   logger?: ShimLogger;
 }
 /**
@@ -1711,8 +1742,14 @@ interface Config {
   probeConsent?: boolean;
   /** Use the largest context window the international catalog explicitly offers. */
   useMaximumContextWindow?: boolean;
+  /** Per-provider/model DSH context budget, keyed `provider:model`. */
+  contextBudgets?: Record<string, number>;
+  /** Per-provider/model fixed native effort, keyed `provider:model`. */
+  reasoningEfforts?: Record<string, WorkBuddyReasoningSelection>;
 }
 declare const Config: z<Config>;
+/** Stable key for a setting that belongs to one provider's model row. */
+declare function modelSettingKey(variantId: string, modelId: string): string;
 /**
  * The account key model-visibility preferences are stored under: the stable
  * identity, but only when it carries a uid.
@@ -1737,4 +1774,4 @@ declare function visibilityAccountOf(credential: Pick<WorkBuddyCredential, 'uid'
  */
 declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { AI_VARIANT, type AppVersionInfo, CN_APP_VERSION_FILENAME, CN_VARIANT, type ChatIdentity, Config, FALLBACK_CN_APP_VERSION, FALLBACK_WORKBUDDY_AI_MODELS, FALLBACK_WORKBUDDY_MODELS, PROBE_EFFORT_CANDIDATES, type ProbeAttempt, type ProbeOutcome, type ProbeSender, type ResolveChatIdentityOptions, type UpstreamErrorKind, WORKBUDDY_AI_SETTINGS_NS, WORKBUDDY_APP_VERSION_FILENAME, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_CATALOG_FILENAME, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_PROBE_FILENAME, WORKBUDDY_PROVIDER, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY_VARIANTS, WORKBUDDY_VISIBILITY_FILENAME, type WorkBuddyAdapter, type WorkBuddyAppVersionSource, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyCatalogFetch, WorkBuddyCatalogStore, type WorkBuddyChatResult, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredits, type WorkBuddyEffort, type WorkBuddyHostHeartbeat, type WorkBuddyModelBilling, type WorkBuddyModelInfo, type WorkBuddyModelReasoning, type WorkBuddyProbeRecord, WorkBuddyProbeService, type WorkBuddyProbeStatus, WorkBuddyProbeStore, type WorkBuddyProbeValidation, type WorkBuddyPromotion, type WorkBuddyRefreshOutcome, type WorkBuddyShim, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyVariant, WorkBuddyVisibilityStore, appUserAgent, apply, chatUserAgent, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthPath, desktopAuthCandidatesFor, fallbackChatIdentity, fingerprintModel, inject, installedAppVersion, isHeartbeatProcessAlive, modelWithCurrentPromotion, name, normalizeCredits, parseModelCatalog, parseWorkBuddyAuth, prepareChatBody, prepareCnChatBody, prepareInternationalChatBody, probeModel, processStartTimeMs, randomSentinel, readBundleVersion, readCliVersion, readHostHeartbeat, regionOf, resolveAppVersion, resolveChatIdentity, validAppVersion, validCliVersion, variantFor, visibilityAccountOf, workbuddyCatalogPath, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, workbuddyProbePath, workbuddyVisibilityPath };
+export { AI_VARIANT, type AppVersionInfo, CN_APP_VERSION_FILENAME, CN_VARIANT, type ChatIdentity, Config, FALLBACK_CN_APP_VERSION, FALLBACK_WORKBUDDY_AI_MODELS, FALLBACK_WORKBUDDY_MODELS, PROBE_EFFORT_CANDIDATES, type ProbeAttempt, type ProbeOutcome, type ProbeSender, type ResolveChatIdentityOptions, type UpstreamErrorKind, WORKBUDDY_AI_SETTINGS_NS, WORKBUDDY_APP_VERSION_FILENAME, WORKBUDDY_AUTH_FILENAME, WORKBUDDY_AUTH_FILE_ENV, WORKBUDDY_CATALOG_FILENAME, WORKBUDDY_HOST_HEARTBEAT_FILENAME, WORKBUDDY_PROBE_FILENAME, WORKBUDDY_PROVIDER, WORKBUDDY_SETTINGS_NS, WORKBUDDY_STREAM_IDLE_TIMEOUT_MS, WORKBUDDY_VARIANTS, WORKBUDDY_VISIBILITY_FILENAME, type WorkBuddyAdapter, type WorkBuddyAppVersionSource, type WorkBuddyAuthStatus, WorkBuddyCatalog, type WorkBuddyCatalogFetch, WorkBuddyCatalogStore, type WorkBuddyChatResult, type WorkBuddyContextMetadata, type WorkBuddyCredential, WorkBuddyCredentialStore, type WorkBuddyCredits, type WorkBuddyEffort, type WorkBuddyHostHeartbeat, type WorkBuddyModelBilling, type WorkBuddyModelInfo, type WorkBuddyModelReasoning, type WorkBuddyProbeRecord, WorkBuddyProbeService, type WorkBuddyProbeStatus, WorkBuddyProbeStore, type WorkBuddyProbeValidation, type WorkBuddyPromotion, type WorkBuddyReasoningSelection, type WorkBuddyRefreshOutcome, type WorkBuddyShim, WorkBuddyUpstreamClient, type WorkBuddyUpstreamModel, type WorkBuddyVariant, WorkBuddyVisibilityStore, appUserAgent, apply, applyReasoningEffortOverride, chatUserAgent, classifyUpstreamError, clearHostHeartbeat, createWorkBuddyAdapter, createWorkBuddyShim, defaultDesktopAuthCandidates, defaultDesktopAuthPath, desktopAuthCandidatesFor, fallbackChatIdentity, fingerprintModel, inject, installedAppVersion, isHeartbeatProcessAlive, modelSettingKey, modelWithCurrentPromotion, name, normalizeCredits, parseModelCatalog, parseWorkBuddyAuth, prepareChatBody, prepareCnChatBody, prepareInternationalChatBody, probeModel, processStartTimeMs, randomSentinel, readBundleVersion, readCachedAppContextMetadata, readCliVersion, readHostHeartbeat, regionOf, resolveAppVersion, resolveChatIdentity, validAppVersion, validCliVersion, variantFor, visibilityAccountOf, workbuddyCatalogPath, workbuddyHostHeartbeatPath, workbuddyOwnAuthPath, workbuddyProbePath, workbuddyVisibilityPath };

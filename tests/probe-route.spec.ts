@@ -177,6 +177,31 @@ describe('probe control route', () => {
     expect(enabled).toBe(true)
   })
 
+  it('accepts per-model context and native-effort writes', async () => {
+    const writes: unknown[] = []
+    const { origin, key } = await mount({
+      setContextWindow: async (model, window) => {
+        writes.push({ model, window })
+        return { state: 'updated' }
+      },
+      setReasoningEffort: async (model, effort) => {
+        writes.push({ model, effort })
+        return { state: 'updated' }
+      },
+    })
+    const headers = { 'X-WorkBuddy-Probe-Key': key }
+    expect(await post(origin, { action: 'set-context-window', model: 'step-5-preview', window: 1_000_000 }, headers))
+      .toMatchObject({ status: 200, body: { state: 'updated' } })
+    expect(await post(origin, { action: 'set-reasoning-effort', model: 'step-5-preview', effort: 'default' }, headers))
+      .toMatchObject({ status: 200, body: { state: 'updated' } })
+    expect(writes).toEqual([
+      { model: 'step-5-preview', window: 1_000_000 },
+      { model: 'step-5-preview', effort: 'default' },
+    ])
+    expect((await post(origin, { action: 'set-context-window', model: 'step-5-preview', window: -1 }, headers)).status).toBe(400)
+    expect((await post(origin, { action: 'set-reasoning-effort', model: 'step-5-preview', effort: 'turbo' }, headers)).status).toBe(400)
+  })
+
   it('mints a distinct key per call', () => {
     expect(createProbeKey()).not.toBe(createProbeKey())
   })

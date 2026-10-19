@@ -21,7 +21,14 @@ import { Readable } from 'node:stream'
 import type { WorkBuddyCredentialStore } from './auth.ts'
 import type { WorkBuddyCatalog } from './catalog.ts'
 import { bindToUsablePort, hostIsLoopback, originIsLoopback } from './loopback.ts'
-import { extractDisplayErrorMessage, prepareChatBody, WorkBuddyUpstreamClient, type UpstreamErrorKind } from './upstream.ts'
+import {
+  applyReasoningEffortOverride,
+  extractDisplayErrorMessage,
+  prepareChatBody,
+  WorkBuddyUpstreamClient,
+  type UpstreamErrorKind,
+  type WorkBuddyReasoningSelection,
+} from './upstream.ts'
 
 /** Minimal logger surface the plugin context already provides. */
 export interface ShimLogger {
@@ -51,6 +58,8 @@ export interface WorkBuddyShimOptions {
   store: WorkBuddyCredentialStore
   client: Pick<WorkBuddyUpstreamClient, 'chatStream'>
   catalog: WorkBuddyCatalog
+  /** Card-selected effort for one model; `default` omits the wire field. */
+  reasoningEffort?: (modelId: string) => WorkBuddyReasoningSelection | undefined
   logger?: ShimLogger
 }
 
@@ -106,7 +115,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
  * is the boundary, and the upstream credential comes from the store alone.
  */
 export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShim {
-  const { store, client, catalog } = options
+  const { store, client, catalog, reasoningEffort } = options
   const logger = options.logger
 
   // Per-process shared secret. Lives only in memory; the adapter resolves it
@@ -214,7 +223,8 @@ export function createWorkBuddyShim(options: WorkBuddyShimOptions): WorkBuddyShi
     }
 
     const raw = (await readBody(req)).toString('utf8')
-    const prepared = prepareChatBody(raw)
+    const selected = reasoningEffort === undefined ? raw : applyReasoningEffortOverride(raw, reasoningEffort)
+    const prepared = prepareChatBody(selected)
 
     const controller = new AbortController()
     req.on('close', () => controller.abort())

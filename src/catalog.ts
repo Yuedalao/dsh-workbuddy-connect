@@ -124,6 +124,7 @@ export class WorkBuddyCatalog {
   private models: readonly WorkBuddyModelInfo[]
   private visible = true
   private useMaximumContextWindow = false
+  private contextBudgets: Readonly<Record<string, number>> = {}
 
   constructor(initial: readonly WorkBuddyModelInfo[] = FALLBACK_WORKBUDDY_MODELS) { this.models = initial }
 
@@ -132,10 +133,23 @@ export class WorkBuddyCatalog {
     if (!this.visible) return []
     return this.models.map(model => {
       const current = modelWithCurrentPromotion(model)
-      const maximum = current.supportedContextWindows === undefined ? undefined : Math.max(...current.supportedContextWindows)
-      return this.useMaximumContextWindow && maximum !== undefined && maximum > current.contextWindow
-        ? { ...current, defaultContextWindow: current.defaultContextWindow ?? current.contextWindow, contextWindow: maximum }
-        : current
+      const supported = current.supportedContextWindows ?? []
+      const requested = this.contextBudgets[current.id]
+      const selected = requested !== undefined && supported.includes(requested)
+        ? requested
+        : undefined
+      const maximum = supported.length > 0 ? Math.max(...supported) : undefined
+      const legacyMaximum = this.useMaximumContextWindow && maximum !== undefined && maximum > current.contextWindow
+        ? maximum
+        : undefined
+      const contextWindow = selected ?? legacyMaximum ?? current.contextWindow
+      return {
+        ...current,
+        ...current.defaultContextWindow === undefined && !this.useMaximumContextWindow && selected === undefined
+          ? {}
+          : { defaultContextWindow: current.defaultContextWindow ?? current.contextWindow },
+        contextWindow,
+      }
     })
   }
 
@@ -163,6 +177,15 @@ export class WorkBuddyCatalog {
   setUseMaximumContextWindow(useMaximum: boolean): boolean {
     if (this.useMaximumContextWindow === useMaximum) return false
     this.useMaximumContextWindow = useMaximum
+    return true
+  }
+
+  /** Select advertised per-model windows; unknown ids/values are ignored. */
+  setContextBudgets(budgets: Readonly<Record<string, number>>): boolean {
+    const next = Object.fromEntries(Object.entries(budgets).filter(([, value]) =>
+      Number.isSafeInteger(value) && value > 0))
+    if (JSON.stringify(next) === JSON.stringify(this.contextBudgets)) return false
+    this.contextBudgets = next
     return true
   }
 

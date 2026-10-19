@@ -314,6 +314,23 @@ describe('international catalog parsing', () => {
     expect(legacyCatalog.current()[0]).toMatchObject({ contextWindow: 1_000_000, defaultContextWindow: 300_000 })
   })
 
+  it('selects each model\'s advertised CN window independently', () => {
+    const catalog = new WorkBuddyCatalog([{
+      id: 'step', name: 'Step', contextWindow: 300_000,
+      defaultContextWindow: 300_000,
+      supportedContextWindows: [300_000, 1_000_000],
+      maxTokens: 64_000, supportsImages: true,
+    }])
+    expect(catalog.current()[0]?.contextWindow).toBe(300_000)
+    expect(catalog.setContextBudgets({ step: 1_000_000 })).toBe(true)
+    expect(catalog.current()[0]).toMatchObject({
+      contextWindow: 1_000_000,
+      defaultContextWindow: 300_000,
+    })
+    catalog.setContextBudgets({ step: 750_000 })
+    expect(catalog.current()[0]?.contextWindow).toBe(300_000)
+  })
+
   it('does not attach international fields to the CN shape', () => {
     const [cn] = parseModelCatalog(document, false)
     expect(cn).toEqual({
@@ -325,6 +342,17 @@ describe('international catalog parsing', () => {
       reasoning: { supports: true, onlyReasoning: true, defaultEffort: 'high', canDisableThinking: false },
       billing: { credits: 'x0.00', free: true },
     })
+  })
+
+  it('keeps declared CN context alternatives while omitting international-only fields', () => {
+    const [, ctx] = parseModelCatalog(document, false)
+    expect(ctx).toMatchObject({
+      contextWindow: 300_000,
+      defaultContextWindow: 300_000,
+      supportedContextWindows: [300_000, 1_000_000],
+    })
+    expect(ctx?.maxInputTokens).toBeUndefined()
+    expect(ctx?.promotions).toBeUndefined()
   })
 
   it('rejects a document with no cli roster rather than serving a partial list', () => {
